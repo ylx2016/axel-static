@@ -1,5 +1,13 @@
 name: build-axel-static
 
+# Binaries are committed straight to the default branch root, together with
+# SHA256SUMS and the generated README block: axel-x86_64-linux-musl,
+# axel-aarch64-linux-musl. Layout and flow follow
+# https://github.com/ylx2016/busybox-static-binaries-fat
+#   - compile job: read-only token, builds in an ephemeral Alpine container
+#   - commit job: needs the whole matrix, gets contents: write, re-stages the
+#     artifacts, re-writes README/SHA256SUMS and pushes
+
 on:
   workflow_dispatch:
     inputs:
@@ -17,14 +25,22 @@ on:
 permissions:
   contents: read
 
+# Parallel runs would compile bit-different binaries and race on the same
+# commit target / SHA256SUMS filename.
+concurrency:
+  group: axel-static-build
+  cancel-in-progress: false
+
 env:
   AXEL_VERSION: ${{ github.event.inputs.axel_version || '2.17.14' }}
   # pinned upstream tarball digest; the build refuses to run without a match
   AXEL_SHA256: ${{ github.event.inputs.axel_sha256 || '938ee7c8c478bf6fcc82359bbf9576f298033e8b13908e53e3ea9c45c1443693' }}
+  # number of matrix rows; a short artifact set must never produce a partial SHA256SUMS
+  EXPECTED_BINS: 2
 
 jobs:
-  build:
-    name: axel-linux-${{ matrix.arch }}
+  compile:
+    name: build-${{ matrix.suffix }}
     # Deliberately NOT `container: alpine`: JavaScript actions (upload-artifact)
     # inside an Alpine container are x64-only on GitHub runners and fail on
     # ubuntu-24.04-arm with "JavaScript Actions in Alpine containers are only
@@ -36,27 +52,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # native amd64 runner, static musl build, UPX packed
-          - arch: amd64
+          # native amd64 runner; UPX has no ELF/aarch64 writer (UPX 5.3 NEWS only
+          # lists linux/riscv64 and win64/arm64 as recent additions), so arm64 is
+          # shipped uncompressed.
+          - suffix: x86_64-linux-musl
             runner: ubuntu-24.04
-            upx: "1"
-          # native arm64 runner (public repos: free; private repos need a paid plan).
-          # UPX has no ELF/aarch64 writer (UPX 5.3 NEWS: only linux/riscv64 and
-          # win64/arm64 were added recently), so arm64 ships uncompressed.
-          - arch: arm64
+            do_upx: "1"
+          - suffix: aarch64-linux-musl
             runner: ubuntu-24.04-arm
-            upx: ""
+            do_upx: ""
     steps:
       - name: Build, pack and smoke-test in Alpine
         env:
           # must NOT be named UPX: UPX reads that variable as its own option string
           # and aborts with "invalid string '1' in environment variable 'UPX'"
-          DO_UPX: ${{ matrix.upx }}
+          DO_UPX: ${{ matrix.do_upx }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
           set -eux
           mkdir -p dist
           docker run --rm \
-            -e AXEL_VERSION -e AXEL_SHA256 -e DO_UPX \
+            -e AXEL_VERSION -e AXEL_SHA256 -e DO_UPX -e SUFFIX \
             -v "$PWD/dist:/dist" \
             alpine:3.20 sh -euxc '
               # busybox-extras carries the httpd applet; Alpine base busybox has none
@@ -128,59 +144,165 @@ jobs:
               ./axel -n 2 -o example.html https://example.com/
               grep -qi "<html" example.html
 
-              case "$(uname -m)" in
-                x86_64) arch=amd64 ;;
-                aarch64) arch=arm64 ;;
-                *) arch="$(uname -m)" ;;
-              esac
-              suffix=""
-              if [ "$DO_UPX" = "1" ]; then suffix="-upx"; fi
-              out="/dist/axel-${AXEL_VERSION}-linux-${arch}${suffix}"
-              cp /tmp/axel "$out"
-              chmod +x "$out"
-              ls -l "$out"
+              cp /tmp/axel "/dist/axel-${SUFFIX}"
+              chmod +x "/dist/axel-${SUFFIX}"
+              ls -l "/dist/axel-${SUFFIX}"
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ format('axel-{0}-linux-{1}{2}', env.AXEL_VERSION, matrix.arch, matrix.upx == '1' && '-upx' || '') }}
-          path: dist/*
+          name: bin-${{ matrix.suffix }}
+          path: dist/axel-${{ matrix.suffix }}
           if-no-files-found: error
+          retention-days: 1
 
-  verify:
-    name: verify-on-distros
-    needs: build
+  commit:
+    # needs: compile is all-or-nothing: any arch failing skips the commit instead
+    # of publishing a partial binary set.
+    needs: compile
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      # Actions are pinned to 40-char commit SHAs: a moved tag could otherwise push
+      # arbitrary content under this job's write token.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: dist
-          pattern: axel-*
-          merge-multiple: true
+          ref: main
+          path: main
+          # keep the credential: this job exists to push, and git-auto-commit-action
+          # has no token input -- it relies on .git/config written by checkout
+          persist-credentials: true
 
-      - name: List artifacts
-        run: ls -lR dist
+      - name: Download binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bin-*
+          # not relying on merge-multiple: if it does not take effect the files land
+          # in <path>/<artifact-name>/ and a flat glob would be empty. Collect
+          # recursively instead so both layouts work.
+          path: main/_dl
 
-      - name: Run on amd64 distros
+      - name: Stage binaries into repo root
+        working-directory: main
         run: |
-          set -eux
-          bin="$(ls dist/axel-*-amd64*)"
-          chmod +x "$bin"
-          for img in alpine:3.20 debian:12 ubuntu:24.04 rockylinux:9; do
-            echo "== $img"
-            docker run --rm -v "$PWD/dist:/d:ro" "$img" "/d/$(basename "$bin")" --version
-            docker run --rm -v "$PWD/dist:/d:ro" "$img" \
-              "/d/$(basename "$bin")" -n 2 -o /tmp/x https://example.com/ || true
+          set -euo pipefail
+          shopt -s nullglob
+          rm -f axel-* SHA256SUMS
+
+          found=()
+          while IFS= read -r -d '' f; do found+=("$f"); done \
+            < <(find _dl -type f -name 'axel-*' -print0 2>/dev/null)
+          echo "found ${#found[@]} binaries (expected ${EXPECTED_BINS})"
+          printf '  %s\n' "${found[@]}"
+
+          if [ "${#found[@]}" -ne "${EXPECTED_BINS}" ]; then
+            echo "binary count ${#found[@]} != expected ${EXPECTED_BINS}"
+            find _dl -maxdepth 3 -ls || true
+            exit 1
+          fi
+
+          for f in "${found[@]}"; do
+            base="$(basename "$f")"
+            if [ -e "$base" ]; then echo "duplicate binary name: $base"; exit 1; fi
+            mv "$f" .
           done
+          rm -rf _dl
+          chmod +x axel-*
 
-      - name: Run on arm64 (qemu)
+          # Hash before anything executes the binaries below: if a binary is dirty it
+          # could rewrite other files on this runner, making a later SHA256SUMS a
+          # valid-looking but poisoned manifest.
+          sha256sum axel-* > .pre-exec.sha256
+          cat .pre-exec.sha256
+
+      - name: Install qemu for the arm64 README run
         run: |
-          set -eux
-          bin="$(ls dist/axel-*-arm64)"
-          chmod +x "$bin"
-          docker run --rm --platform linux/arm64 -v "$PWD/dist:/d:ro" \
-            debian:12 "/d/$(basename "$bin")" --version
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static file
+
+      - name: Assert ELF arch matches filename
+        working-directory: main
+        run: |
+          set -euo pipefail
+          # A binary whose filename lies about its arch is the worst kind of bad
+          # artifact: downstream picks it by name and only fails on the target host.
+          while IFS='|' read -r suffix bits data mach; do
+            [ -n "$suffix" ] || continue
+            f="axel-$suffix"
+            [ -f "$f" ] || { echo "missing binary $f"; exit 1; }
+            out="$(file -b "$f")"
+            case "$out" in
+              "ELF $bits-bit $data"*) ;;
+              *) echo "$f width/endianness mismatch: $out"; exit 1 ;;
+            esac
+            case "$out" in
+              *"$mach"*) ;;
+              *) echo "$f machine mismatch: $out"; exit 1 ;;
+            esac
+          done <<'EOF'
+          x86_64-linux-musl|64|LSB|x86-64
+          aarch64-linux-musl|64|LSB|aarch64
+          EOF
+
+      - name: Regenerate README binary block
+        working-directory: main
+        env:
+          UPX_NOTE: "x86_64 is UPX (--best --lzma) compressed; aarch64 ships uncompressed"
+        run: |
+          set -euo pipefail
+          touch README.md
+          # everything above the marker is hand-written docs and is preserved;
+          # everything below it is regenerated on every build
+          awk '/^<!-- binaries -->$/{exit} {print}' README.md > README.head
+          {
+            cat README.head
+            echo '<!-- binaries -->'
+            echo
+            echo "## axel v${AXEL_VERSION} static binaries"
+            echo
+            echo "Built from the official release tarball (sha256 \`${AXEL_SHA256}\`)."
+            echo
+            echo '```console'
+            echo '$ file axel-*'
+            file axel-*
+            echo
+            echo '$ ./axel-x86_64-linux-musl --version | sed -n 1p'
+            ./axel-x86_64-linux-musl --version | sed -n 1p
+            echo
+            echo '$ qemu-aarch64-static ./axel-aarch64-linux-musl --version | sed -n 1p'
+            qemu-aarch64-static ./axel-aarch64-linux-musl --version | sed -n 1p
+            echo
+            echo '$ sha256sum axel-*'
+            sha256sum axel-*
+            echo '```'
+          } > README.md
+          rm -f README.head
+
+          # re-check after qemu executed the aarch64 binary: if it rewrote any
+          # axel-* file, this fails before a dirty hash reaches SHA256SUMS
+          sha256sum -c .pre-exec.sha256
+          rm -f .pre-exec.sha256
+
+      - name: Generate SHA256SUMS
+        working-directory: main
+        run: |
+          set -euo pipefail
+          count="$(find . -maxdepth 1 -type f -name 'axel-*' | wc -l)"
+          if [ "$count" -ne "${EXPECTED_BINS}" ]; then
+            echo "binary count $count != expected ${EXPECTED_BINS}; refusing a partial SHA256SUMS"
+            ls -l
+            exit 1
+          fi
+          sha256sum axel-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: stefanzweifel/git-auto-commit-action@b863ae1933cb653a53c021fe36dbb774e1fb9403 # v5
+        with:
+          repository: ./main
+          # no token input: the action has none, checkout's credential is used
+          # only the files this pipeline produces are committed
+          file_pattern: "axel-* README.md SHA256SUMS"
+          commit_message: "Auto-build axel ${{ env.AXEL_VERSION }} static linux binaries"
