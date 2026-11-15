@@ -39,9 +39,10 @@ jobs:
     steps:
       - name: Install toolchain
         run: |
+          # busybox-extras carries the httpd applet; Alpine's base busybox does not
           apk add --no-cache \
-            build-base binutils curl file openssl-dev openssl-libs-static \
-            pkgconf tar upx xz zlib-dev zlib-static
+            build-base binutils busybox-extras curl file openssl-dev \
+            openssl-libs-static pkgconf tar upx xz zlib-dev zlib-static
 
       - name: Fetch source
         run: |
@@ -97,8 +98,12 @@ jobs:
 
           mkdir -p www
           dd if=/dev/urandom of=www/payload.bin bs=1M count=16 status=none
-          busybox httpd -p 8099 -h /tmp/www
+          # daemonizes by default (no -f); alpine's busybox-extras enables
+          # CONFIG_FEATURE_HTTPD_RANGES, so 206 must come back or multi-conn is fake
+          /usr/sbin/httpd -p 8099 -h /tmp/www
           sleep 1
+          code="$(curl -s -o /dev/null -w '%{http_code}' -r 0-99 http://127.0.0.1:8099/payload.bin)"
+          test "$code" = "206"
           ./axel -n 4 -o out.bin http://127.0.0.1:8099/payload.bin
           cmp www/payload.bin out.bin
 
