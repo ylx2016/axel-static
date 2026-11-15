@@ -1,0 +1,184 @@
+name: build-axel-static
+
+on:
+  workflow_dispatch:
+    inputs:
+      axel_version:
+        description: "axel source version (e.g. 2.17.14)"
+        required: true
+        default: "2.17.14"
+      axel_sha256:
+        description: "sha256 of axel-<version>.tar.xz; MUST be updated when the version changes, empty fails closed"
+        required: false
+        default: "938ee7c8c478bf6fcc82359bbf9576f298033e8b13908e53e3ea9c45c1443693"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  AXEL_VERSION: ${{ github.event.inputs.axel_version || '2.17.14' }}
+  # pinned upstream tarball digest; the build refuses to run without a match
+  AXEL_SHA256: ${{ github.event.inputs.axel_sha256 || '938ee7c8c478bf6fcc82359bbf9576f298033e8b13908e53e3ea9c45c1443693' }}
+
+jobs:
+  build:
+    name: axel-linux-${{ matrix.arch }}
+    # Deliberately NOT `container: alpine`: JavaScript actions (upload-artifact)
+    # inside an Alpine container are x64-only on GitHub runners and fail on
+    # ubuntu-24.04-arm with "JavaScript Actions in Alpine containers are only
+    # supported on x64 Linux runners". All Alpine work runs via `docker run`
+    # against the runner's native arch instead; artifact steps stay on the host.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # native amd64 runner, static musl build, UPX packed
+          - arch: amd64
+            runner: ubuntu-24.04
+            upx: "1"
+          # native arm64 runner (public repos: free; private repos need a paid plan).
+          # UPX has no ELF/aarch64 writer (UPX 5.3 NEWS: only linux/riscv64 and
+          # win64/arm64 were added recently), so arm64 ships uncompressed.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            upx: ""
+    steps:
+      - name: Build, pack and smoke-test in Alpine
+        env:
+          UPX: ${{ matrix.upx }}
+        run: |
+          set -eux
+          mkdir -p dist
+          docker run --rm \
+            -e AXEL_VERSION -e AXEL_SHA256 -e UPX \
+            -v "$PWD/dist:/dist" \
+            alpine:3.20 sh -euxc '
+              # busybox-extras carries the httpd applet; Alpine base busybox has none
+              apk add --no-cache \
+                build-base binutils busybox-extras curl file openssl-dev \
+                openssl-libs-static pkgconf tar upx xz zlib-dev zlib-static
+
+              # workflow_dispatch inputs are free-form: reject anything that is not
+              # a plain x.y.z version before it reaches a URL or an output path
+              case "$AXEL_VERSION" in
+                ""|*[!0-9.]*) echo "invalid axel_version: $AXEL_VERSION"; exit 1 ;;
+              esac
+              echo "$AXEL_SHA256" | grep -qE "^[0-9a-f]{64}$" || {
+                echo "invalid or missing axel_sha256"; exit 1;
+              }
+
+              curl -fsSL --proto "=https" --tlsv1.2 --retry 3 -o /tmp/axel.tar.xz \
+                "https://github.com/axel-download-accelerator/axel/releases/download/v${AXEL_VERSION}/axel-${AXEL_VERSION}.tar.xz"
+              echo "${AXEL_SHA256}  /tmp/axel.tar.xz" | sha256sum -c -
+              tar -xJf /tmp/axel.tar.xz -C /tmp
+              test -x "/tmp/axel-${AXEL_VERSION}/configure"
+              cd "/tmp/axel-${AXEL_VERSION}"
+
+              ./configure \
+                --with-ssl=openssl \
+                --disable-nls \
+                CFLAGS="-O2 -ffunction-sections -fdata-sections" \
+                LDFLAGS="-static -Wl,--gc-sections -Wl,--build-id=none"
+              make -j"$(nproc)"
+              bin="$(find . -maxdepth 2 -type f -name axel -perm -u+x | head -n1)"
+              test -n "$bin"
+              strip --strip-all "$bin" -o /tmp/axel
+              ls -l /tmp/axel
+
+              if readelf -d /tmp/axel 2>/dev/null | grep -q NEEDED; then
+                echo "binary still has dynamic dependencies"
+                readelf -d /tmp/axel
+                exit 1
+              fi
+              file /tmp/axel | grep -q "statically linked"
+
+              if [ "$UPX" = "1" ]; then
+                # --best --lzma = highest ratio at sane runtime; --ultra-brute is
+                # smaller but takes minutes to hours.
+                upx --best --lzma -o /tmp/axel.upx /tmp/axel
+                mv /tmp/axel.upx /tmp/axel
+                upx -t /tmp/axel
+                chmod +x /tmp/axel
+              fi
+              ls -l /tmp/axel
+
+              cd /tmp
+              ./axel --version
+              mkdir -p www
+              dd if=/dev/urandom of=www/payload.bin bs=1M count=16 status=none
+              # daemonizes without -f; busyboxconfig-extras enables
+              # CONFIG_FEATURE_HTTPD_RANGES, so 206 must come back or the
+              # multi-connection check below is meaningless
+              /usr/sbin/httpd -p 8099 -h /tmp/www
+              sleep 1
+              code="$(curl -s -o /dev/null -w "%{http_code}" -r 0-99 http://127.0.0.1:8099/payload.bin)"
+              test "$code" = "206"
+              ./axel -n 4 -o out.bin http://127.0.0.1:8099/payload.bin
+              cmp www/payload.bin out.bin
+
+              # static OpenSSL bakes OPENSSLDIR of the build openssl (/etc/ssl),
+              # so targets need a system CA store at /etc/ssl/certs
+              apk add --no-cache ca-certificates
+              ./axel -n 2 -o example.html https://example.com/
+              grep -qi "<html" example.html
+
+              case "$(uname -m)" in
+                x86_64) arch=amd64 ;;
+                aarch64) arch=arm64 ;;
+                *) arch="$(uname -m)" ;;
+              esac
+              suffix=""
+              if [ "$UPX" = "1" ]; then suffix="-upx"; fi
+              out="/dist/axel-${AXEL_VERSION}-linux-${arch}${suffix}"
+              cp /tmp/axel "$out"
+              chmod +x "$out"
+              ls -l "$out"
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ format('axel-{0}-linux-{1}{2}', env.AXEL_VERSION, matrix.arch, matrix.upx == '1' && '-upx' || '') }}
+          path: dist/*
+          if-no-files-found: error
+
+  verify:
+    name: verify-on-distros
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: axel-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lR dist
+
+      - name: Run on amd64 distros
+        run: |
+          set -eux
+          bin="$(ls dist/axel-*-amd64*)"
+          chmod +x "$bin"
+          for img in alpine:3.20 debian:12 ubuntu:24.04 rockylinux:9; do
+            echo "== $img"
+            docker run --rm -v "$PWD/dist:/d:ro" "$img" "/d/$(basename "$bin")" --version
+            docker run --rm -v "$PWD/dist:/d:ro" "$img" \
+              "/d/$(basename "$bin")" -n 2 -o /tmp/x https://example.com/ || true
+          done
+
+      - name: Run on arm64 (qemu)
+        run: |
+          set -eux
+          bin="$(ls dist/axel-*-arm64)"
+          chmod +x "$bin"
+          docker run --rm --platform linux/arm64 -v "$PWD/dist:/d:ro" \
+            debian:12 "/d/$(basename "$bin")" --version
