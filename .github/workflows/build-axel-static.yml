@@ -49,12 +49,14 @@ jobs:
     steps:
       - name: Build, pack and smoke-test in Alpine
         env:
-          UPX: ${{ matrix.upx }}
+          # must NOT be named UPX: UPX reads that variable as its own option string
+          # and aborts with "invalid string '1' in environment variable 'UPX'"
+          DO_UPX: ${{ matrix.upx }}
         run: |
           set -eux
           mkdir -p dist
           docker run --rm \
-            -e AXEL_VERSION -e AXEL_SHA256 -e UPX \
+            -e AXEL_VERSION -e AXEL_SHA256 -e DO_UPX \
             -v "$PWD/dist:/dist" \
             alpine:3.20 sh -euxc '
               # busybox-extras carries the httpd applet; Alpine base busybox has none
@@ -96,7 +98,7 @@ jobs:
               fi
               file /tmp/axel | grep -q "statically linked"
 
-              if [ "$UPX" = "1" ]; then
+              if [ "$DO_UPX" = "1" ]; then
                 # --best --lzma = highest ratio at sane runtime; --ultra-brute is
                 # smaller but takes minutes to hours.
                 upx --best --lzma -o /tmp/axel.upx /tmp/axel
@@ -132,7 +134,7 @@ jobs:
                 *) arch="$(uname -m)" ;;
               esac
               suffix=""
-              if [ "$UPX" = "1" ]; then suffix="-upx"; fi
+              if [ "$DO_UPX" = "1" ]; then suffix="-upx"; fi
               out="/dist/axel-${AXEL_VERSION}-linux-${arch}${suffix}"
               cp /tmp/axel "$out"
               chmod +x "$out"
